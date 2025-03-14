@@ -52,7 +52,7 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
 
     private proxyConnections: SSHConnection[] = [];
     private sshConnection: SSHConnection | undefined;
-    private sshAgentSock: string | undefined;
+    private identityAgentSock: string | undefined;
     private proxyCommandProcess: cp.ChildProcessWithoutNullStreams | undefined;
 
     private socksTunnel: SSHTunnelConfig | undefined;
@@ -117,17 +117,30 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
                         value, valuesToInterpolate);
                 };
 
-                const identityAgent = sshHostConfig['IdentityAgent'] ? interpolatePath(sshHostConfig['IdentityAgent']) : undefined;
-                this.sshAgentSock = identityAgent || process.env['SSH_AUTH_SOCK'] || (isWindows ? '\\\\.\\pipe\\openssh-ssh-agent' : undefined);
-                this.sshAgentSock = this.sshAgentSock ? untildify(this.sshAgentSock) : undefined;
-                const agentForward = enableAgentForwarding && (sshHostConfig['ForwardAgent'] || 'no').toLowerCase() === 'yes';
-                const agent = agentForward && this.sshAgentSock ? new ssh2.OpenSSHAgent(this.sshAgentSock) : undefined;
+                const parseForwardAgent = (forwardAgentValue: string | undefined, identityAgentSock: string | undefined) => {
+                    if (!enableAgentForwarding) { return undefined; }
+                    switch (forwardAgentValue) {
+                        case 'yes':
+                            return identityAgentSock;
+                        case 'no':
+                        case undefined:
+                            return undefined;
+                        default:
+                            return untildify(interpolatePath(sshHostConfig['ForwardAgent']));
+                    }
+                };
+
+                const identityAgentValue = sshHostConfig['IdentityAgent'] ? interpolatePath(sshHostConfig['IdentityAgent']) : undefined;
+                this.identityAgentSock = identityAgentValue || process.env['SSH_AUTH_SOCK'] || (isWindows ? '\\\\.\\pipe\\openssh-ssh-agent' : undefined);
+                this.identityAgentSock = this.identityAgentSock ? untildify(this.identityAgentSock) : undefined;
+                const forwardAgentSock = parseForwardAgent(sshHostConfig['ForwardAgent'], this.identityAgentSock);
+                const forwardAgent = forwardAgentSock ? new ssh2.OpenSSHAgent(forwardAgentSock) : undefined;
 
                 const preferredAuthentications = sshHostConfig['PreferredAuthentications'] ? sshHostConfig['PreferredAuthentications'].split(',').map(s => s.trim()) : ['publickey', 'password', 'keyboard-interactive'];
 
                 const identityFiles: string[] = (sshHostConfig['IdentityFile']?.map(f => untildify(interpolatePath(f)))) || [];
                 const identitiesOnly = (sshHostConfig['IdentitiesOnly'] || 'no').toLowerCase() === 'yes';
-                const identityKeys = await gatherIdentityFiles(identityFiles, this.sshAgentSock, identitiesOnly, this.logger);
+                const identityKeys = await gatherIdentityFiles(identityFiles, this.identityAgentSock, identitiesOnly, this.logger);
 
                 // Create proxy jump connections if any
                 let proxyStream: ssh2.ClientChannel | stream.Duplex | undefined;
@@ -144,12 +157,12 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
                         const proxyUser = proxyHostConfig['User'] || proxy.user || sshUser;
                         const proxyPort = proxyHostConfig['Port'] ? parseInt(proxyHostConfig['Port'], 10) : (proxy.port || sshPort);
 
-                        const proxyAgentForward = enableAgentForwarding && (proxyHostConfig['ForwardAgent'] || 'no').toLowerCase() === 'yes';
-                        const proxyAgent = proxyAgentForward && this.sshAgentSock ? new ssh2.OpenSSHAgent(this.sshAgentSock) : undefined;
+                        const proxyAgentForwardSock = parseForwardAgent(proxyHostConfig['ForwardAgent'], this.identityAgentSock);
+                        const proxyAgent = proxyAgentForwardSock ? new ssh2.OpenSSHAgent(proxyAgentForwardSock) : undefined;
 
                         const proxyIdentityFiles: string[] = (proxyHostConfig['IdentityFile']?.map(f => untildify(interpolatePath(f)))) || [];
                         const proxyIdentitiesOnly = (proxyHostConfig['IdentitiesOnly'] || 'no').toLowerCase() === 'yes';
-                        const proxyIdentityKeys = await gatherIdentityFiles(proxyIdentityFiles, this.sshAgentSock, proxyIdentitiesOnly, this.logger);
+                        const proxyIdentityKeys = await gatherIdentityFiles(proxyIdentityFiles, this.identityAgentSock, proxyIdentitiesOnly, this.logger);
 
                         const proxyAuthHandler = this.getSSHAuthHandler(proxyUser, proxyHostName, proxyIdentityKeys, preferredAuthentications);
                         const proxyConnection = new SSHConnection({
@@ -159,7 +172,7 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
                             username: proxyUser,
                             readyTimeout: connectTimeout * 1000,
                             strictVendor: false,
-                            agentForward: proxyAgentForward,
+                            agentForward: !!proxyAgent,
                             agent: proxyAgent,
                             authHandler: (arg0, arg1, arg2) => (proxyAuthHandler(arg0, arg1, arg2), undefined)
                         });
@@ -205,14 +218,14 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
                     username: sshUser,
                     readyTimeout: connectTimeout * 1000,
                     strictVendor: false,
-                    agentForward,
-                    agent,
+                    agentForward: !!forwardAgent,
+                    agent: forwardAgent,
                     authHandler: (arg0, arg1, arg2) => (sshAuthHandler(arg0, arg1, arg2), undefined),
                 });
                 await this.sshConnection.connect();
 
                 const envVariables: Record<string, string | null> = {};
-                if (agentForward) {
+                if (!!forwardAgent) {
                     envVariables['SSH_AUTH_SOCK'] = null;
                 }
 
@@ -375,7 +388,7 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
                             override getIdentities(callback: (err: Error | undefined, publicKeys?: ParsedKey[]) => void): void {
                                 callback(undefined, [identityKey.parsedKey]);
                             }
-                        }(this.sshAgentSock!)
+                        }(this.identityAgentSock!)
                     });
                 }
                 if (identityKey.isPrivate) {
